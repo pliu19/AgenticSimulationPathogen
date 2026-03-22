@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(grep -rh \"^import\\\\|^from\" /c/Users/pliu1/Documents/ABM-Antimicrobial/src/*.py)",
+      "Bash(python3:*)",
+      "Bash(file:*)",
+      "Bash(gh auth:*)",
+      "Bash(where gh:*)",
+      "Bash(gh repo:*)",
+      "Bash(git rm:*)",
+      "Bash(git commit:*)",
+      "Bash(git remote:*)",
+      "Bash(git push:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
