@@ -13,7 +13,8 @@ import numpy as np
 from abm import HealthCareWorker, Patient
 from config import (
     PATHOGENS, INIT_SPECIES_PROBS, INIT_PHENOTYPE_PROBS,
-    MUTATION_PATHWAYS, min_drug_level, is_covered,
+    EMPIRIC_AGENTS_1, EMPIRIC_AGENTS_2, MUTATION_PATHWAYS,
+    is_covered, min_covering_agent,
 )
 
 
@@ -36,24 +37,20 @@ def initial_patient(args, name, current_day):
     """
     Create a newly admitted patient.
 
-    With probability args.a the patient arrives colonized with an ESKAPE
-    pathogen drawn from the ICU prevalence distribution.  Otherwise the
-    patient has no ESKAPE colonization (species='none').
+    Species is drawn from INIT_SPECIES_PROBS, which includes 'none' (uncolonized).
+    If a species is drawn, phenotype is drawn from INIT_PHENOTYPE_PROBS.
     """
-    a = float(args.a)
+    species_list  = list(INIT_SPECIES_PROBS.keys())
+    species_probs = list(INIT_SPECIES_PROBS.values())
+    species = np.random.choice(species_list, p=species_probs)
 
-    if draw() < a:
-        species_list  = list(INIT_SPECIES_PROBS.keys())
-        species_probs = list(INIT_SPECIES_PROBS.values())
-        species = np.random.choice(species_list, p=species_probs)
-
+    if species == 'none':
+        phenotype = 'none'
+    else:
         pheno_dict      = INIT_PHENOTYPE_PROBS[species]
         phenotype_list  = list(pheno_dict.keys())
         phenotype_probs = list(pheno_dict.values())
         phenotype = np.random.choice(phenotype_list, p=phenotype_probs)
-    else:
-        species   = 'none'
-        phenotype = 'none'
 
     patient = Patient(args, name, current_day, species, phenotype)
     patient.recordStatus('initialization', 0)
@@ -115,18 +112,20 @@ def ph_interaction(patient, healthW, args, current_day, current_hour,
     r = float(args.r)
     s = float(args.s)
 
+    review_hours = args.empiric_hours
+
     if patient.status == 'C':
         healthW, patient = _contact_colonised(
             patient, healthW, args, current_day, reference_results, p, q)
 
     elif patient.status == 'I' and patient.treat_time is not None \
-            and patient.treat_time <= 3 * 24:
+            and patient.treat_time <= review_hours:
         healthW, patient = _contact_infected_early(
             patient, healthW, args, current_day, current_hour,
             reference_results, q, r)
 
     elif patient.status == 'I' and patient.treat_time is not None \
-            and patient.treat_time > 3 * 24:
+            and patient.treat_time > review_hours:
         healthW, patient = _contact_infected_late(
             patient, healthW, current_hour, reference_results, q, s)
 
@@ -195,13 +194,13 @@ def _uncovered_hcw_strains(healthW, patient):
     Includes same-species strains with a more resistant phenotype (resistance
     upgrade within a species).
     """
-    dlevel = patient.drug_level if patient.drug_level is not None else 4
+    dagent = patient.drug_agent
     result = []
     for h_sp, h_ph in healthW.strain_set:
         # Skip identical strain
         if h_sp == patient.species and h_ph == patient.phenotype:
             continue
-        if not is_covered(dlevel, h_sp, h_ph):
+        if not is_covered(dagent, h_sp, h_ph):
             result.append((h_sp, h_ph))
     return result
 
@@ -233,11 +232,33 @@ def hcw_cleanUp(healthW, current_hour, eta=0.5, end_of_shift=False):
 
 # ─── Daily Events ─────────────────────────────────────────────────────────────
 
+def get_empiric_agent(species, args, current_day):
+    """
+    Select the empiric agent for a species based on the active regimen:
+      fixed   — always group 1
+      cycling — group 1 for N months, then group 2 for N months, repeating
+      mixing  — group 1 or group 2 chosen with equal probability per patient
+    Falls back to 'meropenem' for unregistered species.
+    """
+    regimen = getattr(args, 'empiric_regimen', 'fixed')
+
+    if regimen == 'cycling':
+        current_month  = current_day // 30
+        cycle_position = (current_month // args.cycle_months) % 2
+        agents = EMPIRIC_AGENTS_1 if cycle_position == 0 else EMPIRIC_AGENTS_2
+    elif regimen == 'mixing':
+        agents = EMPIRIC_AGENTS_1 if draw() < 0.5 else EMPIRIC_AGENTS_2
+    else:  # fixed
+        agents = EMPIRIC_AGENTS_1
+
+    return agents.get(species, 'meropenem')
+
+
 def infection_development(patients_record, current_patients, current_day,
-                           reference_results):
+                           reference_results, args, daily_counters):
     """
     Colonised patients whose infct_time has arrived progress to active
-    infection.  Empiric broad-spectrum therapy (level 4) is started.
+    infection.  Species-specific empiric agent is assigned via get_empiric_agent().
     """
     for key in current_patients:
         patient = patients_record[key]
@@ -247,7 +268,13 @@ def infection_development(patients_record, current_patients, current_day,
 
             patient.status     = 'I'
             patient.treat_time = 0
-            patient.drug_level = 4        # empiric broad-spectrum
+            agent = get_empiric_agent(patient.species, args, current_day)
+            patient.drug_agent = agent
+            # Track which empiric group was assigned
+            if agent == EMPIRIC_AGENTS_1.get(patient.species, 'meropenem'):
+                daily_counters['empiric_group_1'] += 1
+            else:
+                daily_counters['empiric_group_2'] += 1
 
             if patient.species != 'none':
                 patient.lab_result = (patient.species, patient.phenotype)
@@ -268,83 +295,43 @@ def increase_treatment_icu_time(patients_record, current_patients):
         patient = patients_record[key]
         patient.time_inICU += 24
         if isinstance(patient.treat_time, int):
-            patient.treat_time += 24
+            patient.treat_time       += 24
+            patient.total_treat_time += 24
     return patients_record
 
 
-def drug_change_control(reference_results, patients_record, current_patients,
-                         current_hour):
+def drug_change(reference_results, patients_record, current_patients,
+                current_hour, args, daily_counters):
     """
-    Control arm: Stay on broad-spectrum (level 4) after 72-h lab results
-    unless the identified pathogen mandates Reserve therapy (level 5).
+    At empiric_hours: if the empiric agent covers the identified phenotype, keep it.
+    Otherwise escalate to the lowest-level non-last-resort covering agent,
+    or last-resort if no other agent covers the pathogen.
     Re-evaluates after any strain conversion.
     """
+    review_hours = args.empiric_hours
+
     for key in current_patients:
         patient = patients_record[key]
 
-        if patient.treat_time == 3 * 24 and patient.lab_result is not None:
+        if patient.treat_time == review_hours and patient.lab_result is not None:
             sp, ph = patient.lab_result
-            required = min_drug_level(sp, ph)
-            # Control arm: escalate to 5 only if strictly necessary; else stay at 4
-            new_level = 5 if required == 5 else 4
-            patient.drug_level = new_level
-            dlkey = f'drug_level_{new_level}_use'
-            reference_results[dlkey] = reference_results.get(dlkey, 0) + 1
-            if new_level < required:
+            if not is_covered(patient.drug_agent, sp, ph):
+                new_agent = min_covering_agent(sp, ph)
+                patient.drug_agent = new_agent
+                dakey = f'drug_agent_{new_agent}_use'
+                reference_results[dakey] = reference_results.get(dakey, 0) + 1
                 reference_results['misempiric'] = \
                     reference_results.get('misempiric', 0) + 1
+                daily_counters['misempiric_daily'] += 1
 
         elif (patient.convt_time is not None
-              and (current_hour - patient.convt_time) == 3 * 24):
+              and (current_hour - patient.convt_time) == review_hours):
             sp, ph = patient.species, patient.phenotype
-            required = min_drug_level(sp, ph)
-            new_level = 5 if required == 5 else 4
-            patient.drug_level = new_level
-            dlkey = f'drug_level_{new_level}_use'
-            reference_results[dlkey] = reference_results.get(dlkey, 0) + 1
-
-    return patients_record
-
-
-def drug_change_ADE(reference_results, patients_record, current_patients,
-                    current_hour):
-    """
-    ADE arm: At 72 h de-escalate to the MINIMUM effective spectrum level
-    indicated by the lab result.  Re-evaluates after any strain conversion.
-    """
-    for key in current_patients:
-        patient = patients_record[key]
-
-        if patient.treat_time == 3 * 24:
-            if patient.lab_result is not None:
-                sp, ph = patient.lab_result
-                new_level = min_drug_level(sp, ph)
-            else:
-                new_level = 4   # no result yet; keep broad
-
-            old_level = patient.drug_level or 4
-            patient.drug_level = new_level
-            dlkey = f'drug_level_{new_level}_use'
-            reference_results[dlkey] = reference_results.get(dlkey, 0) + 1
-
-            if new_level < old_level:
-                reference_results['deescalation'] = \
-                    reference_results.get('deescalation', 0) + 1
-            elif new_level > old_level:
-                reference_results['escalation'] = \
-                    reference_results.get('escalation', 0) + 1
-
-        elif (patient.convt_time is not None
-              and (current_hour - patient.convt_time) == 3 * 24):
-            sp, ph = patient.species, patient.phenotype
-            new_level = min_drug_level(sp, ph)
-            old_level = patient.drug_level or 4
-            patient.drug_level = new_level
-            dlkey = f'drug_level_{new_level}_use'
-            reference_results[dlkey] = reference_results.get(dlkey, 0) + 1
-            if new_level < old_level:
-                reference_results['deescalation'] = \
-                    reference_results.get('deescalation', 0) + 1
+            if not is_covered(patient.drug_agent, sp, ph):
+                new_agent = min_covering_agent(sp, ph)
+                patient.drug_agent = new_agent
+                dakey = f'drug_agent_{new_agent}_use'
+                reference_results[dakey] = reference_results.get(dakey, 0) + 1
 
     return patients_record
 
@@ -382,12 +369,12 @@ def treatment_completion(reference_results, patients_record, current_patients,
             patient.treat_time = None
             patient.convt_time = None
             patient.lab_result = None
-            patient.drug_level = None
+            patient.drug_agent = None
     return patients_record
 
 
 def intrinsic_mutation(patients_record, current_patients, args, current_hour,
-                        reference_results):
+                        reference_results, first_mutation_times):
     """
     Resistance emergence under antibiotic selective pressure.
 
@@ -404,23 +391,29 @@ def intrinsic_mutation(patients_record, current_patients, args, current_hour,
             continue
 
         # Only mutate under effective drug pressure
-        if not is_covered(patient.drug_level, patient.species, patient.phenotype):
+        if not is_covered(patient.drug_agent, patient.species, patient.phenotype):
             continue
 
         if draw() < epsilon:
-            next_ph = MUTATION_PATHWAYS.get((patient.species, patient.phenotype))
-            if next_ph is not None:
+            next_ph_options = MUTATION_PATHWAYS.get((patient.species, patient.phenotype))
+            if next_ph_options is not None:
+                next_ph = random.choice(next_ph_options)
                 patient.phenotype  = next_ph
                 if patient.convt_time is None:
                     patient.convt_time = current_hour
                 mkey = f'mutation_{patient.species}_{next_ph}'
                 reference_results[mkey] = reference_results.get(mkey, 0) + 1
+                # Record day of first mutation to this phenotype
+                fkey = (patient.species, next_ph)
+                if first_mutation_times.get(fkey) is None:
+                    first_mutation_times[fkey] = current_hour // 24
 
     return patients_record
 
 
 def discharge_admission(patients_record, current_hour, args, discharge_probs,
-                         current_patients, patient_last_idx, reference_results):
+                         current_patients, patient_last_idx, reference_results,
+                         treat_lengths, icu_los):
     """
     Stochastic discharge events.  Discharged patients are immediately
     replaced by a newly initialised admission.
@@ -440,7 +433,8 @@ def discharge_admission(patients_record, current_hour, args, discharge_probs,
         if patient.time_inICU == 40 * 24:
             patient_last_idx, current_patients = _replace_patient(
                 patients_record, current_patients, key, patient_last_idx,
-                args, current_day, reference_results, event='discharge')
+                args, current_day, reference_results, treat_lengths, icu_los,
+                event='discharge')
             continue
 
         if patient.super_infe or patient.time_inICU < 2 * 24:
@@ -454,17 +448,19 @@ def discharge_admission(patients_record, current_hour, args, discharge_probs,
         if draw() < prob:
             patient_last_idx, current_patients = _replace_patient(
                 patients_record, current_patients, key, patient_last_idx,
-                args, current_day, reference_results, event='discharge')
+                args, current_day, reference_results, treat_lengths, icu_los,
+                event='discharge')
 
     return patients_record, current_patients, patient_last_idx
 
 
 def death_event(patients_record, current_patients, patient_last_idx,
-                current_hour, args, death_probs, reference_results):
+                current_hour, args, death_probs, reference_results,
+                treat_lengths, icu_los):
     """
     Stochastic death events.
 
-    Patients on inadequate therapy (drug level doesn't cover their pathogen)
+    Patients on inadequate therapy (drug agent doesn't cover their pathogen)
     face an elevated mortality hazard (kappa_nu).
     """
     current_day = current_hour // 24
@@ -477,25 +473,29 @@ def death_event(patients_record, current_patients, patient_last_idx,
         base_prob = death_probs.get(day, 0)
 
         inadequate = (patient.species != 'none'
-                      and not is_covered(patient.drug_level,
+                      and not is_covered(patient.drug_agent,
                                          patient.species, patient.phenotype))
         prob = base_prob * kappa_nu if inadequate else base_prob
 
         if draw() < prob:
             patient_last_idx, current_patients = _replace_patient(
                 patients_record, current_patients, key, patient_last_idx,
-                args, current_day, reference_results, event='death')
+                args, current_day, reference_results, treat_lengths, icu_los,
+                event='death')
 
     return patients_record, current_patients, patient_last_idx
 
 
 def _replace_patient(patients_record, current_patients, old_key,
                       patient_last_idx, args, current_day,
-                      reference_results, event):
+                      reference_results, treat_lengths, icu_los, event):
     """
     Replace a departing patient with a newly admitted one.
     Increments admission + event (discharge/death) counters.
+    Records total treatment hours and ICU length of stay for the departing patient.
     """
+    treat_lengths.append(patients_record[old_key].total_treat_time)
+    icu_los.append(patients_record[old_key].time_inICU)
     patient_last_idx += 1
     patients_record[patient_last_idx] = initial_patient(args, patient_last_idx,
                                                          current_day)

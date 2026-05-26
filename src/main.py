@@ -3,15 +3,13 @@
 """
 Main simulation loop for the ESKAPE multi-pathogen ICU ABM.
 
-Two trial arms are supported:
-  ADE     — Antimicrobial De-Escalation: at 72 h switch to the narrowest
-             agent that covers the identified pathogen.
-  control — Standard care: stay on broad-spectrum (level 4) after 72-h
-             lab results unless Reserve (level 5) is strictly required.
+Drug change rule: at 72 h keep the empiric agent if it covers the identified
+phenotype; otherwise escalate to the minimum covering agent (last-resort
+only if no lower-level agent covers the pathogen).
 
 Usage examples:
-    python main.py --arm ADE     --num_runs 1000
-    python main.py --arm control --num_runs 1000
+    python main.py --num_runs 1000
+    python main.py --num_runs 10 --days 30
 """
 
 import os
@@ -21,16 +19,15 @@ import math
 import time
 import pickle
 
-import scipy.integrate as integrate
-import scipy.stats as stats
+import numpy as np
 
 from abm import HealthCareWorker
-from config import PATHOGENS, DRUG_LEVELS
+from config import PATHOGENS, AGENT_LEVEL
 from scheme_func import (
     draw, initial_patient, random_schedule, bulk_initialization,
     ph_interaction, hcw_cleanUp,
     infection_development, increase_treatment_icu_time,
-    drug_change_control, drug_change_ADE,
+    drug_change,
     treatment_completion, discharge_admission, death_event,
     intrinsic_mutation,
 )
@@ -39,25 +36,21 @@ from scheme_func import (
 # ─── Utility functions ────────────────────────────────────────────────────────
 
 def truncnorm_func(mean, std_rate):
-    """Sample from a truncated normal distribution centred on mean."""
+    """Sample from a truncated normal distribution centred on mean (±1 std)."""
     if std_rate == 0 or mean == 0:
         return mean
-    bounded = abs(mean) * std_rate
-    std     = abs(mean) * std_rate
-    lower   = (mean - bounded - mean) / std   # = -1
-    upper   = (mean + bounded - mean) / std   # = +1
-    X = stats.truncnorm(lower, upper, loc=mean, scale=std)
-    return max(1e-5, X.rvs())
-
-
-def _constant(x, lam):
-    return lam
+    std = abs(mean) * std_rate
+    while True:
+        sample = np.random.normal(mean, std)
+        if mean - std <= sample <= mean + std:
+            return max(1e-5, sample)
 
 
 def read_csv(file_path):
     """
     Read a day → probability CSV and return a dict of survival probabilities
     computed via the hazard-integral method used in the original model.
+    Integrating a constant lam from 0 to t gives lam * t.
     """
     record = {}
     with open(file_path, 'r') as f:
@@ -68,11 +61,7 @@ def read_csv(file_path):
                 prob    = float(parts[1])
                 record[day_idx] = prob
 
-    result = {}
-    for key, value in record.items():
-        I = integrate.quad(_constant, 0, key, args=(value,))[0]
-        result[key] = value * math.exp(-I)
-    return result
+    return {key: value * math.exp(-value * key) for key, value in record.items()}
 
 
 def recordEverything(data, arm, file_path):
@@ -93,12 +82,11 @@ def make_reference_results():
     """
     r = {
         'admission': 0, 'discharge': 0, 'death': 0,
-        'cumsuperinfection': 0, 'misempiric': 0, 'tempempiric': 0,
-        'deescalation': 0, 'escalation': 0,
+        'cumsuperinfection': 0, 'misempiric': 0,
         'cuminfection_none': 0,
     }
-    for level in DRUG_LEVELS:
-        r[f'drug_level_{level}_use'] = 0
+    for agent in AGENT_LEVEL:
+        r[f'drug_agent_{agent}_use'] = 0
 
     for sp, cfg in PATHOGENS.items():
         for ph in cfg['phenotypes']:
@@ -113,20 +101,43 @@ def make_reference_results():
 
 # ─── Main simulation loop ─────────────────────────────────────────────────────
 
-def main(args, drug_change_func):
+def main(args):
     """
     Run one complete simulation of args.days days.
     Returns final_results: a dict of daily time-series and cumulative counters.
     """
     reference_results = make_reference_results()
 
-    # Daily census arrays
-    final_results = {'superinfection': [0] * args.days}
+    # Per-patient lists (one entry per discharge/death) — variable length
+    treat_lengths = []
+    icu_los       = []
+
+    # Per-run first-mutation tracking: (species, phenotype) -> simulation day
+    first_mutation_times = {
+        (sp, ph): None
+        for sp, cfg in PATHOGENS.items()
+        for ph in cfg['phenotypes']
+    }
+
+    # Daily reset counters (reset to 0 after each day's snapshot)
+    daily_counters = {
+        'empiric_group_1': 0,
+        'empiric_group_2': 0,
+        'misempiric_daily': 0,
+    }
+
+    # Daily census arrays — pre-allocated numpy arrays (int32)
+    final_results = {'superinfection': np.zeros(args.days, dtype=np.int32)}
     for sp, cfg in PATHOGENS.items():
         for ph in cfg['phenotypes']:
-            final_results[f'infection_{sp}_{ph}'] = [0] * args.days
+            final_results[f'infection_{sp}_{ph}']        = np.zeros(args.days, dtype=np.int32)
+            final_results[f'colonization_prev_{sp}_{ph}'] = np.zeros(args.days, dtype=np.int32)
+    final_results['hcw_contamination_burden'] = np.zeros(args.days, dtype=np.float32)
+    final_results['empiric_group_1_daily']    = np.zeros(args.days, dtype=np.int32)
+    final_results['empiric_group_2_daily']    = np.zeros(args.days, dtype=np.int32)
+    final_results['misempiric_daily']         = np.zeros(args.days, dtype=np.int32)
     for key in reference_results:
-        final_results[key] = []
+        final_results[key] = np.zeros(args.days, dtype=np.int32)
 
     assert args.num_patient % args.num_hcw == 0, \
         "num_patient must be divisible by num_hcw"
@@ -146,6 +157,7 @@ def main(args, drug_change_func):
     for _ in range(args.days):
 
         # ── Three 8-hour shifts ───────────────────────────────────────────
+        hcw_burden_sum = 0.0
         for _shift in range(3):
             schedule  = random_schedule(current_p_names, args.num_hcw)
             visit_idx = 0
@@ -161,6 +173,9 @@ def main(args, drug_change_func):
                 visit_idx    += 1
                 current_hour += args.time_interval
 
+            # Snapshot burden before cleanup (avg strains per HCW this shift)
+            hcw_burden_sum += sum(len(hcw_list[h].strain_set) for h in hcw_list) / len(hcw_list)
+
             # End-of-shift: guaranteed HCW decontamination
             for hid in hcw_list:
                 hcw_list[hid] = hcw_cleanUp(
@@ -168,42 +183,71 @@ def main(args, drug_change_func):
 
         # ── End-of-day events ────────────────────────────────────────────
         patient_list = infection_development(
-            patient_list, current_p_names, current_day, reference_results)
+            patient_list, current_p_names, current_day, reference_results,
+            args, daily_counters)
 
         patient_list = intrinsic_mutation(
-            patient_list, current_p_names, args, current_hour, reference_results)
+            patient_list, current_p_names, args, current_hour,
+            reference_results, first_mutation_times)
 
         patient_list = increase_treatment_icu_time(
             patient_list, current_p_names)
 
-        patient_list = drug_change_func(
-            reference_results, patient_list, current_p_names, current_hour)
+        patient_list = drug_change(
+            reference_results, patient_list, current_p_names, current_hour,
+            args, daily_counters)
 
         patient_list = treatment_completion(
             reference_results, patient_list, current_p_names, current_hour)
 
         patient_list, current_p_names, patient_idx = discharge_admission(
             patient_list, current_hour, args, discharge_probs,
-            current_p_names, patient_idx, reference_results)
+            current_p_names, patient_idx, reference_results,
+            treat_lengths, icu_los)
 
         patient_list, current_p_names, patient_idx = death_event(
             patient_list, current_p_names, patient_idx, current_hour,
-            args, death_probs, reference_results)
+            args, death_probs, reference_results, treat_lengths, icu_los)
 
         # ── Daily snapshot ───────────────────────────────────────────────
         for key in reference_results:
-            final_results[key].append(reference_results[key])
+            final_results[key][current_day] = reference_results[key]
 
         for pt_key in current_p_names:
             patient = patient_list[pt_key]
             if patient.status == 'I' and patient.species != 'none':
-                ikey = f'infection_{patient.species}_{patient.phenotype}'
-                final_results[ikey][current_day] += 1
+                final_results[f'infection_{patient.species}_{patient.phenotype}'][current_day] += 1
             if patient.super_infe:
                 final_results['superinfection'][current_day] += 1
 
+        # Colonization prevalence — single pass over patients
+        col_counts = {}
+        for k in current_p_names:
+            pt = patient_list[k]
+            if pt.status == 'C' and pt.species != 'none':
+                col_counts[(pt.species, pt.phenotype)] = col_counts.get((pt.species, pt.phenotype), 0) + 1
+        for sp, cfg in PATHOGENS.items():
+            for ph in cfg['phenotypes']:
+                final_results[f'colonization_prev_{sp}_{ph}'][current_day] = col_counts.get((sp, ph), 0)
+
+        # HCW contamination burden — daily average across 3 shifts (pre-cleanup)
+        final_results['hcw_contamination_burden'][current_day] = hcw_burden_sum / 3
+
+        # Daily counters snapshot then reset
+        final_results['empiric_group_1_daily'][current_day] = daily_counters['empiric_group_1']
+        final_results['empiric_group_2_daily'][current_day] = daily_counters['empiric_group_2']
+        final_results['misempiric_daily'][current_day]      = daily_counters['misempiric_daily']
+        for k in daily_counters:
+            daily_counters[k] = 0
+
         current_day += 1
 
+    final_results['treatment_length_on_discharge'] = treat_lengths
+    final_results['icu_los_on_discharge']          = icu_los
+    final_results['first_mutation_day'] = {
+        f'{sp}_{ph}': day
+        for (sp, ph), day in first_mutation_times.items()
+    }
     return final_results
 
 
@@ -215,8 +259,6 @@ if __name__ == '__main__':
         description='ESKAPE ICU ABM — multi-pathogen antimicrobial stewardship simulation')
 
     # ── Trial design ─────────────────────────────────────────────────────
-    parser.add_argument('--arm', default='ADE', choices=['ADE', 'control'],
-                        help='Stewardship arm (default: ADE)')
     parser.add_argument('--days', type=int, default=1460,
                         help='Simulation duration in days (default: 1460 = 4 years)')
     parser.add_argument('--num_runs', type=int, default=1000,
@@ -242,21 +284,19 @@ if __name__ == '__main__':
     parser.add_argument('--eta', type=float, default=0.50,
                         help='Hand-hygiene compliance (default: 0.50)')
 
+    # ── Empiric regimen ───────────────────────────────────────────────────
+    parser.add_argument('--empiric_regimen', default='fixed',
+                        choices=['fixed', 'cycling', 'mixing'],
+                        help='Empiric agent selection regimen (default: fixed)')
+    parser.add_argument('--cycle_months', type=int, default=6,
+                        help='Months per group in cycling regimen (default: 6)')
+    parser.add_argument('--empiric_hours', type=int, default=72,
+                        choices=[24, 48, 72],
+                        help='Duration of empiric therapy before drug review (default: 72)')
+
     # ── Pathogen dynamics ────────────────────────────────────────────────
     parser.add_argument('--epsilon', type=float, default=0.03,
                         help='Intrinsic mutation hazard (default: 0.03)')
-    # sigmax / sigmac kept for backward compatibility;
-    # per-pathogen sigma values are now defined in config.PATHOGENS
-    parser.add_argument('--sigmax', type=float, default=0.16,
-                        help='Fallback sigma for unregistered susceptible strains')
-    parser.add_argument('--sigmac', type=float, default=0.45,
-                        help='Fallback sigma for unregistered resistant strains')
-
-    # ── Admission parameters ─────────────────────────────────────────────
-    parser.add_argument('--a', type=float, default=0.10,
-                        help='Probability of ESKAPE colonization on admission (default: 0.10)')
-    parser.add_argument('--m', type=float, default=0.60,
-                        help='Prior pathogen exposure probability (default: 0.60)')
 
     # ── Clinical outcome hazard ratios ────────────────────────────────────
     parser.add_argument('--kappa_mu', type=float, default=0.74,
@@ -272,17 +312,19 @@ if __name__ == '__main__':
     parser.add_argument('--std', type=float, default=0.0,
                         help='Noise level for Monte Carlo parameter sampling (0 = deterministic)')
 
+    # ── Output ────────────────────────────────────────────────────────────
+    parser.add_argument('--run_name', type=str, default='',
+                        help='Optional subfolder under log/ for batch organisation (e.g. run2)')
+
     args = parser.parse_args()
 
-    # Select drug-change function based on trial arm
-    drug_change_func = drug_change_ADE if args.arm == 'ADE' else drug_change_control
-
-    base_dir = f'./log/{args.arm}_p{args.num_patient}_h{args.num_hcw}/'
+    subdir = f'{args.run_name}/' if args.run_name else ''
+    base_dir = (f'./log/{subdir}{args.empiric_regimen}_h{args.empiric_hours}'
+                f'_p{args.p}_q{args.q}_r{args.r}_n{args.num_patient}_w{args.num_hcw}/')
     os.makedirs(base_dir, exist_ok=True)
 
     # Parameters perturbed per run when std > 0
-    noisy_params = ['a', 'p', 'q', 'r', 's', 'epsilon',
-                    'sigmax', 'sigmac', 'eta', 'kappa_mu', 'kappa_nu']
+    noisy_params = ['p', 'q', 'r', 's', 'epsilon', 'eta', 'kappa_mu', 'kappa_nu']
 
     whole_res = {}
 
@@ -293,10 +335,10 @@ if __name__ == '__main__':
                 val = getattr(args, param)
                 setattr(run_args, param, truncnorm_func(val, args.std))
 
-        whole_res[i] = main(run_args, drug_change_func)
+        whole_res[i] = main(run_args)
 
         if i % 50 == 0:
-            print(f'[{args.arm}] run {i}/{args.num_runs}')
+            print(f'run {i}/{args.num_runs}')
 
-    recordEverything(whole_res, args.arm, base_dir)
+    recordEverything(whole_res, 'sim', base_dir)
     print(f'Results saved to {base_dir}')

@@ -129,5 +129,19 @@ dmypy.json
 .pyre/
 
 # Pickle file
-.pickle
-.pkl
+*.pickle
+*.pkl
+
+# Simulation outputs and batch logs
+src/log/
+log/
+run*_log.txt
+
+# Ad-hoc scratch
+tmp_*.py
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

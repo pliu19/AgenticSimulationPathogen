@@ -35,7 +35,7 @@ class Patient:
         status (str):       'C' (colonized/carrier) or 'I' (infected).
         species (str):      ESKAPE species key (see config.PATHOGENS) or 'none'.
         phenotype (str):    Resistance phenotype string or 'none'.
-        drug_level (int):   WHO AWaRe level 1-5, or None if not on treatment.
+        drug_agent (str):   Treating agent name (see config.AGENT_LEVEL), or None if not on treatment.
         treat_time (int):   Hours since treatment started; None if not infected.
         convt_time (int):   Hour at which dominant pathogen changed; None if unchanged.
         lab_result (tuple): (species, phenotype) confirmed by lab, or None.
@@ -50,8 +50,9 @@ class Patient:
         self.status = 'C'
         self.species = species
         self.phenotype = phenotype
-        self.drug_level = None
+        self.drug_agent = None
         self.treat_time = None
+        self.total_treat_time = 0
         self.convt_time = None
         self.lab_result = None
         self.time_inICU = 0
@@ -90,9 +91,8 @@ class Patient:
         from config import PATHOGENS
         cfg = PATHOGENS.get(self.species)
         if cfg:
-            return cfg['sigma'].get(self.phenotype, float(args.sigmac))
-        # Fallback to args if species not in registry
-        return float(args.sigmax) if self.species == 'none' else float(args.sigmac)
+            return cfg['sigma'].get(self.phenotype, 0.10)
+        return 0.0  # uncolonized (species='none') never progresses to infection
 
     # ── Record-keeping ────────────────────────────────────────────────────────
 
@@ -106,8 +106,9 @@ class Patient:
                 'status':     self.status,
                 'species':    self.species,
                 'phenotype':  self.phenotype,
-                'drug_level': self.drug_level,
-                'lab_result': self.lab_result,
+                'drug_agent':        self.drug_agent,
+                'total_treat_time':  self.total_treat_time,
+                'lab_result':        self.lab_result,
                 'time_inICU': self.time_inICU,
                 'infct_time': self.infct_time,
                 'treat_time': self.treat_time,
