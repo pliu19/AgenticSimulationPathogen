@@ -72,7 +72,9 @@ Key knobs at the top of the script:
 - `RUN_NAME` — output subfolder under `src/log/` (e.g. `'run2'`, `'run3'`); set this before each batch.
 - `MAX_PARALLEL` — semaphore-limited concurrent process count (default 20).
 
-Jobs whose output directory already contains a `.pkl` are skipped, so the batch can resume safely after interruption. A monitor thread prints progress, rate, ETA, process count, and RAM every 2 minutes.
+Paths are derived from the script location, so no edits are needed per machine. The interpreter is resolved in this order: `ABM_PYTHON` env var → `<repo>/.venv/bin/python` (or `.venv\Scripts\python.exe` on Windows) → the current `python`. `ABM_SRC_DIR` and `ABM_MAIN` env vars are available for one-off overrides.
+
+Jobs whose output directory already contains a `.pkl` are skipped, so the batch can resume safely after interruption. A monitor thread prints progress, rate, ETA, process count, and RAM every 2 minutes (cross-platform: `ps` on Linux/macOS, `tasklist` on Windows).
 
 ## Key parameters
 

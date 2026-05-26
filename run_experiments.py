@@ -8,13 +8,42 @@ r = p, s = 0.1 * p.
 import glob
 import os
 import subprocess
+import sys
 import threading
 import time
 from itertools import product
 
-PYTHON      = r'C:/Users/pliu1/anaconda3/python.exe'
-MAIN        = r'C:/Users/pliu1/Documents/ABM-Antimicrobial/src/main.py'
-SRC_DIR     = r'C:/Users/pliu1/Documents/ABM-Antimicrobial/src'
+# Paths are derived from this file's location so the script runs unchanged on
+# any machine (Linux / macOS / Windows). Override with env vars if needed.
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR   = os.environ.get('ABM_SRC_DIR', os.path.join(REPO_ROOT, 'src'))
+MAIN      = os.environ.get('ABM_MAIN',    os.path.join(SRC_DIR, 'main.py'))
+
+
+def _resolve_python():
+    """Prefer the project's .venv interpreter; fall back to the current one.
+
+    Honors ABM_PYTHON if set. Looks for a venv at <repo>/.venv (Linux/macOS
+    use bin/python; Windows uses Scripts/python.exe).
+    """
+    override = os.environ.get('ABM_PYTHON')
+    if override:
+        return override
+    venv = os.path.join(REPO_ROOT, '.venv')
+    candidates = [
+        os.path.join(venv, 'bin', 'python'),         # Unix
+        os.path.join(venv, 'Scripts', 'python.exe'), # Windows
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    print(f'[WARN] No .venv found at {venv}; using {sys.executable}. '
+          f'Create one with: python -m venv .venv && '
+          f'.venv/bin/pip install -r requirements.txt', flush=True)
+    return sys.executable
+
+
+PYTHON      = _resolve_python()
 MAX_PARALLEL = 20  # ~20 concurrent processes on 28 logical cores
 MONITOR_INTERVAL = 120  # seconds between monitor prints
 
@@ -43,22 +72,45 @@ start_time = time.time()
 # ─── Monitor thread ───────────────────────────────────────────────────────────
 
 def _get_python_memory_mb():
-    """Return (process_count, total_MB) for all python.exe processes via tasklist."""
+    """Return (process_count, total_MB) across all running python processes.
+
+    Cross-platform: uses `tasklist` on Windows and `ps` elsewhere.
+    """
     try:
+        if os.name == 'nt':
+            out = subprocess.check_output(
+                ['tasklist', '/FI', 'IMAGENAME eq python.exe', '/FO', 'CSV', '/NH'],
+                text=True, stderr=subprocess.DEVNULL)
+            total_kb = 0
+            count = 0
+            for line in out.strip().splitlines():
+                parts = line.strip('"').split('","')
+                if len(parts) >= 5:
+                    mem_str = parts[4].replace(',', '').replace(' K', '').strip()
+                    try:
+                        total_kb += int(mem_str)
+                        count += 1
+                    except ValueError:
+                        pass
+            return count, total_kb / 1024
+        # Linux / macOS: RSS in KB from `ps`, filter to python procs by command name.
         out = subprocess.check_output(
-            ['tasklist', '/FI', 'IMAGENAME eq python.exe', '/FO', 'CSV', '/NH'],
+            ['ps', '-eo', 'comm=,rss='],
             text=True, stderr=subprocess.DEVNULL)
         total_kb = 0
         count = 0
         for line in out.strip().splitlines():
-            parts = line.strip('"').split('","')
-            if len(parts) >= 5:
-                mem_str = parts[4].replace(',', '').replace(' K', '').strip()
-                try:
-                    total_kb += int(mem_str)
-                    count += 1
-                except ValueError:
-                    pass
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            comm, rss = parts[0], parts[1].strip()
+            if 'python' not in os.path.basename(comm).lower():
+                continue
+            try:
+                total_kb += int(rss)
+                count += 1
+            except ValueError:
+                pass
         return count, total_kb / 1024
     except Exception:
         return 0, 0.0

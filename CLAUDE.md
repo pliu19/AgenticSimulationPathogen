@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Stochastic Agent-Based Model (ABM) of multi-pathogen ESKAPE dynamics and antimicrobial stewardship in a 64-bed ICU. The simulation models transmission of the full ESKAPE pathogen group (E. faecium, S. aureus, K. pneumoniae, A. baumannii, P. aeruginosa, Enterobacter spp.) between patients and healthcare workers (HCWs), using a 3-level WHO AWaRe drug classification (Access / Watch / Reserve). Drug assignment is agent-specific. Empiric therapy is assigned by species at infection onset using one of two agent groups, selected via a configurable regimen (fixed, cycling, or mixing).
 
+## Setup
+
+See [`README.md`](./README.md#setup-on-a-new-machine) for the venv + `pip install -r requirements.txt` flow. `run_experiments.py` auto-detects `.venv/bin/python` (Unix) or `.venv\Scripts\python.exe` (Windows) at the repo root, so use that interpreter for all commands below.
+
 ## Running the Simulation
 
 ```bash
@@ -45,7 +49,8 @@ Key design:
 - **Race-condition safe**: a `claimed` set (guarded by `done_lock`) prevents two threads from claiming the same job simultaneously.
 - Output lands in `src/log/{RUN_NAME}/` — set `RUN_NAME` at the top of `run_experiments.py` before each batch (e.g. `'run2'`, `'run3'`).
 - `r = p` and `s = 0.1 × p` — both derived from `p` and passed explicitly.
-- **Monitor thread**: prints progress, rate, ETA, process count, and RAM every 2 minutes to the log file.
+- **Path resolution is automatic**: `REPO_ROOT`, `SRC_DIR`, `MAIN` are computed from `__file__`; the interpreter is auto-resolved as `ABM_PYTHON` env var → `<repo>/.venv/bin/python` (or `.venv\Scripts\python.exe` on Windows) → `sys.executable`. `ABM_SRC_DIR` and `ABM_MAIN` are available as one-off overrides. No per-machine edits required.
+- **Monitor thread**: prints progress, rate, ETA, process count, and RAM every 2 minutes to the log file. Memory probe is cross-platform — `ps` on Linux/macOS, `tasklist` on Windows.
 
 ## Key Parameters
 
@@ -61,17 +66,22 @@ Key design:
 | `--s` | 0.015 | Super-infection probability, late phase; set to `0.1 × p` in batch runs |
 | `--eta` | 0.50 | Hand-hygiene compliance |
 | `--epsilon` | 0.03 | Intrinsic mutation hazard |
+| `--time_interval` | 2 | Hours between HCW patient visits within a shift |
+| `--kappa_mu` | 0.74 | Discharge hazard ratio for infected patients |
+| `--kappa_nu` | 1.04 | Death hazard multiplier for inadequately treated patients |
 | `--empiric_regimen` | `fixed` | Empiric group selection: `fixed`, `cycling`, `mixing` |
 | `--cycle_months` | 6 | Months per group in cycling regimen |
 | `--empiric_hours` | 72 | Hours before drug review (24, 48, or 72) |
 | `--std` | 0.0 | Parameter noise for Monte Carlo (0 = deterministic) |
+
+When `--std > 0`, the per-run perturbation in `main.py` covers: `p`, `q`, `r`, `s`, `epsilon`, `eta`, `kappa_mu`, `kappa_nu`.
 
 ## Architecture
 
 ### Source Files (`src/`)
 
 **`config.py`** — Single source of truth for all biological parameters. Contains:
-- `PATHOGENS` — ESKAPE species registry: phenotypes (susceptible + 2 resistance phenotypes + dual), per-phenotype sigma (colonization→infection probability), treatment durations (7 / 10 / 14 days).
+- `PATHOGENS` — ESKAPE species registry: phenotypes (susceptible + 2 resistance phenotypes + dual), sigma (colonization→infection probability — keyed per phenotype, but currently set to a single per-species value across all four phenotypes), treatment durations (7 / 10 / 14 days).
 - `DRUG_LEVELS` — 3-level AWaRe classification: Access (1), Watch (2), Reserve (3).
 - `AGENT_LEVEL` — Maps each named agent to its AWaRe level.
 - `AGENT_COVERAGE` — Maps each agent to the set of `(species, phenotype)` it covers. `last-resort` covers all phenotypes.
