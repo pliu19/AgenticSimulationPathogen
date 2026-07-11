@@ -145,3 +145,7 @@ tmp_*.py
 .idea/
 .DS_Store
 Thumbs.db
+
+# LibreOffice / Office lockfiles
+.~lock.*#
+~$*

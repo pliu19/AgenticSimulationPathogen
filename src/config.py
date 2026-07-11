@@ -1,204 +1,209 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 """
-Configuration registry for the ESKAPE multi-pathogen ICU ABM.
+Runtime config layer for the ESKAPE multi-pathogen ICU ABM.
 
-All pathogen biology, drug coverage, and ecological parameters live here.
-Event functions in scheme_func.py read from this module rather than using
-hardcoded if/elif chains.
+Data lives in config_data.py (auto-generated from the two excel workbooks
+by build_config.py at the repo root). This module adds the helper
+functions used by scheme_func.py and main.py:
+
+  * effective_coverage(drug, species, resistances)
+  * best_agent(species, resistances)
+  * mutation_target(species, drug)
+  * empiric_group_1(species), empiric_group_2(species)
+
+Patient phenotype state in this version is a FROZENSET of resistance
+labels (e.g. frozenset({'Pip-Tazo-R', 'Meropenem-R'})). The empty set is
+'Susceptible'. Coverage of a drug against a patient is the minimum
+coverage across every label in the set.
 """
 
-# ─── ESKAPE Pathogen Registry ──────────────────────────────────────────────────
-# sigma: per-phenotype probability that colonization progresses to active infection
-# treatment_days: susceptible=7, resistance phenotypes=10, dual=14
-PATHOGENS = {
-    'efaecium': {
-        'full_name': 'Enterococcus faecium',
-        'phenotypes': ['susceptible', 'VREfm', 'LRE', 'dual'],
-        'sigma': {'susceptible': 0.08, 'VREfm': 0.08, 'LRE': 0.08, 'dual': 0.08},
-        'treatment_days': {'susceptible': 7, 'VREfm': 10, 'LRE': 10, 'dual': 14},
-    },
-    'saureus': {
-        'full_name': 'Staphylococcus aureus',
-        'phenotypes': ['susceptible', 'VRSA', 'MRSA', 'dual'],
-        'sigma': {'susceptible': 0.04, 'VRSA': 0.04, 'MRSA': 0.04, 'dual': 0.04},
-        'treatment_days': {'susceptible': 7, 'VRSA': 10, 'MRSA': 10, 'dual': 14},
-    },
-    'kpneumoniae': {
-        'full_name': 'Klebsiella pneumoniae',
-        'phenotypes': ['susceptible', 'PTR-KP', 'CRKP', 'dual'],
-        'sigma': {'susceptible': 0.22, 'PTR-KP': 0.22, 'CRKP': 0.22, 'dual': 0.22},
-        'treatment_days': {'susceptible': 7, 'PTR-KP': 10, 'CRKP': 10, 'dual': 14},
-    },
-    'abaumannii': {
-        'full_name': 'Acinetobacter baumannii',
-        'phenotypes': ['susceptible', 'CRAB', 'SAMR-AB', 'dual'],
-        'sigma': {'susceptible': 0.278, 'CRAB': 0.278, 'SAMR-AB': 0.278, 'dual': 0.278},
-        'treatment_days': {'susceptible': 7, 'CRAB': 10, 'SAMR-AB': 10, 'dual': 14},
-    },
-    'paeruginosa': {
-        'full_name': 'Pseudomonas aeruginosa',
-        'phenotypes': ['susceptible', 'PTR-PA', 'CRPA', 'dual'],
-        'sigma': {'susceptible': 0.23, 'PTR-PA': 0.23, 'CRPA': 0.23, 'dual': 0.23},
-        'treatment_days': {'susceptible': 7, 'PTR-PA': 10, 'CRPA': 10, 'dual': 14},
-    },
-    'enterobacter': {
-        'full_name': 'Enterobacter spp.',
-        'phenotypes': ['susceptible', 'CRE', 'ESBL', 'dual'],
-        'sigma': {'susceptible': 0.03, 'CRE': 0.03, 'ESBL': 0.03, 'dual': 0.03},
-        'treatment_days': {'susceptible': 7, 'CRE': 10, 'ESBL': 10, 'dual': 14},
-    },
-}
+from __future__ import annotations
 
-# ─── WHO AWaRe Drug Classification ────────────────────────────────────────────
-DRUG_LEVELS = {
-    1: {'label': 'Access',  'examples': 'Ampicillin-sulbactam, Nafcillin/Oxacillin'},
-    2: {'label': 'Watch',   'examples': 'Vancomycin, Pip-Tazo, Cefepime, Meropenem'},
-    3: {'label': 'Reserve', 'examples': 'Linezolid, Last-resort'},
-}
+from config_data import (
+    PATHOGENS,
+    INIT_SPECIES_PROBS,
+    INIT_PHENOTYPE_PROBS,
+    DRUG_TIER,
+    DRUG_TO_R_PHENOTYPE,
+    COVERAGE_MATRIX,
+)
 
-# ─── Agent-Level Mapping ──────────────────────────────────────────────────────
-AGENT_LEVEL = {
-    'nafcillin':     1,
-    'amp-sulbactam': 1,
-    'vancomycin':    2,
-    'pip-tazo':      2,
-    'cefepime':      2,
-    'meropenem':     2,
-    'linezolid':     3,
-    'last-resort':   3,
-}
-
-# ─── Agent Coverage Matrix ────────────────────────────────────────────────────
-# Maps each agent to the set of (species, phenotype) it covers.
-# 'last-resort' covers all phenotypes and is handled as a special case in is_covered().
-AGENT_COVERAGE = {
-    'nafcillin': {
-        ('saureus', 'susceptible'), ('saureus', 'VRSA'),
-    },
-    'amp-sulbactam': {
-        ('abaumannii', 'susceptible'), ('abaumannii', 'CRAB'),
-    },
-    'vancomycin': {
-        ('efaecium', 'susceptible'),
-        ('saureus',  'susceptible'), ('saureus',  'MRSA'),
-    },
-    'pip-tazo': {
-        ('kpneumoniae', 'susceptible'), ('kpneumoniae', 'CRKP'),
-        ('paeruginosa', 'susceptible'), ('paeruginosa', 'CRPA'),
-    },
-    'cefepime': {
-        ('kpneumoniae',  'susceptible'), ('kpneumoniae',  'PTR-KP'),
-        ('enterobacter', 'susceptible'), ('enterobacter', 'CRE'),
-    },
-    'meropenem': {
-        ('abaumannii',   'susceptible'), ('abaumannii',   'SAMR-AB'),
-        ('paeruginosa',  'susceptible'), ('paeruginosa',  'PTR-PA'),
-        ('enterobacter', 'susceptible'), ('enterobacter', 'ESBL'),
-    },
-    'linezolid': {
-        ('efaecium', 'susceptible'), ('efaecium', 'LRE'), ('efaecium', 'VREfm'),
-    },
-}
-
-# ─── Empiric Agents ───────────────────────────────────────────────────────────
-# First agent given at infection onset, by species.
-# Species is assumed known at onset; phenotype is confirmed at 72 h by lab.
-# Group is selected by empiric regimen: fixed (always group 1), cycling
-# (alternate every N months), or mixing (50/50 random per patient).
-
-EMPIRIC_AGENTS_1 = {
-    'efaecium':     'vancomycin',
-    'saureus':      'vancomycin',
-    'kpneumoniae':  'pip-tazo',
-    'abaumannii':   'meropenem',
-    'paeruginosa':  'meropenem',
-    'enterobacter': 'meropenem',
-}
-
-EMPIRIC_AGENTS_2 = {
-    'efaecium':     'linezolid',
-    'saureus':      'nafcillin',
-    'kpneumoniae':  'cefepime',
-    'abaumannii':   'amp-sulbactam',
-    'paeruginosa':  'pip-tazo',
-    'enterobacter': 'cefepime',
-}
-
-# ─── Intrinsic Mutation Pathways ───────────────────────────────────────────────
-# Resistance escalation under treatment pressure (drug covers current phenotype,
-# selecting for more-resistant mutants).
-# Format: (species, current_phenotype) -> [list of possible next phenotypes]
-# When mutation fires, one next phenotype is chosen at random from the list.
-MUTATION_PATHWAYS = {
-    ('efaecium',     'susceptible'): ['VREfm', 'LRE'],
-    ('efaecium',     'VREfm'):       ['dual'],
-    ('efaecium',     'LRE'):         ['dual'],
-    ('saureus',      'susceptible'): ['VRSA', 'MRSA'],
-    ('saureus',      'VRSA'):        ['dual'],
-    ('saureus',      'MRSA'):        ['dual'],
-    ('kpneumoniae',  'susceptible'): ['PTR-KP', 'CRKP'],
-    ('kpneumoniae',  'PTR-KP'):      ['dual'],
-    ('kpneumoniae',  'CRKP'):        ['dual'],
-    ('abaumannii',   'susceptible'): ['CRAB', 'SAMR-AB'],
-    ('abaumannii',   'CRAB'):        ['dual'],
-    ('abaumannii',   'SAMR-AB'):     ['dual'],
-    ('paeruginosa',  'susceptible'): ['PTR-PA', 'CRPA'],
-    ('paeruginosa',  'PTR-PA'):      ['dual'],
-    ('paeruginosa',  'CRPA'):        ['dual'],
-    ('enterobacter', 'susceptible'): ['CRE', 'ESBL'],
-    ('enterobacter', 'CRE'):         ['dual'],
-    ('enterobacter', 'ESBL'):        ['dual'],
-}
-
-# ─── Initial Population Distribution ─────────────────────────────────────────
-# Probability of being colonized with each ESKAPE species on ICU admission.
-INIT_SPECIES_PROBS = {
-    'none':         0.554,
-    'saureus':      0.300,
-    'kpneumoniae':  0.050,
-    'paeruginosa':  0.026,
-    'efaecium':     0.030,
-    'abaumannii':   0.030,
-    'enterobacter': 0.010,
-}
-
-# Within-species resistance phenotype distribution for newly admitted patients.
-# PLACEHOLDER: equal distribution — update with ICU surveillance data.
-INIT_PHENOTYPE_PROBS = {
-    'efaecium':     {'susceptible': 0.922, 'VREfm': 0.058, 'LRE': 0.02,  'dual': 0.0},
-    'saureus':      {'susceptible': 0.799, 'VRSA':  0.001, 'MRSA': 0.2,  'dual': 0.0},
-    'kpneumoniae':  {'susceptible': 0.32,  'PTR-KP': 0.28, 'CRKP': 0.4,  'dual': 0.0},
-    'abaumannii':   {'susceptible': 0.49,  'CRAB':  0.06,  'SAMR-AB': 0.45, 'dual': 0.0},
-    'paeruginosa':  {'susceptible': 0.70,  'PTR-PA': 0.18, 'CRPA': 0.12, 'dual': 0.0},
-    'enterobacter': {'susceptible': 0.736, 'CRE':   0.014, 'ESBL': 0.25, 'dual': 0.0},
-}
+__all__ = [
+    'PATHOGENS', 'INIT_SPECIES_PROBS', 'INIT_PHENOTYPE_PROBS',
+    'DRUG_TIER', 'DRUG_TO_R_PHENOTYPE', 'COVERAGE_MATRIX',
+    'COVERAGE_RANK', 'SUSCEPTIBLE_LABEL',
+    'effective_coverage', 'best_agent', 'mutation_target',
+    'empiric_group_1', 'empiric_group_2', 'treatment_days_for',
+    'all_drugs',
+]
 
 
-# ─── Coverage Helper Functions ────────────────────────────────────────────────
+# ─── Coverage state ordering ─────────────────────────────────────────────────
+# Worst → best. The min over a resistance set composes monotonically.
 
-def is_covered(drug_agent, species, phenotype):
-    """Return True if drug_agent provides adequate coverage for (species, phenotype)."""
-    if drug_agent is None:
-        return False
-    if species == 'none':
-        return True
-    if drug_agent == 'last-resort':
-        return True
-    return (species, phenotype) in AGENT_COVERAGE.get(drug_agent, set())
+COVERAGE_RANK = {'none': 0, 'partial': 1, 'covers': 2}
+COVERAGE_LABEL = {0: 'none', 1: 'partial', 2: 'covers'}
+SUSCEPTIBLE_LABEL = 'Susceptible'
 
 
-def min_covering_agent(species, phenotype):
+def all_drugs() -> list[str]:
+    """Drugs ordered by (tier, name) for deterministic iteration."""
+    return sorted(DRUG_TIER, key=lambda d: (DRUG_TIER[d], d))
+
+
+def effective_coverage(drug: str, species: str, resistances) -> str:
+    """Coverage of drug against a patient with the given resistance set.
+
+    Composition rule: min over every label in `resistances` (worst case
+    wins). Empty set → look up the Susceptible column. Returns one of
+    'covers' | 'partial' | 'none'. Unknown drug / species returns 'none'.
     """
-    Return the lowest-level non-last-resort agent that covers (species, phenotype).
-    Falls back to 'last-resort' if no other agent covers it.
+    if species == 'none' or species is None:
+        return 'covers'
+    sp_cov = COVERAGE_MATRIX.get(species)
+    if sp_cov is None:
+        return 'none'
+    drug_cov = sp_cov.get(drug)
+    if drug_cov is None:
+        return 'none'
+
+    if not resistances:
+        return drug_cov.get(SUSCEPTIBLE_LABEL, 'none')
+
+    worst = COVERAGE_RANK['covers']
+    for r in resistances:
+        state = drug_cov.get(r)
+        if state is None:
+            # Unknown resistance label for this species — be conservative.
+            return 'none'
+        rank = COVERAGE_RANK[state]
+        if rank < worst:
+            worst = rank
+            if worst == 0:
+                return 'none'
+    return COVERAGE_LABEL[worst]
+
+
+def best_agent(species: str, resistances) -> str | None:
+    """Lowest-tier drug that covers the (species, resistance set).
+
+    Prefer 'covers' (🟢) over 'partial' (🟡) at any tier. Among ties,
+    pick the alphabetically first drug for determinism. Returns None if
+    no drug has even partial coverage.
     """
-    best_agent = None
-    best_level = 999
-    for agent, coverage in AGENT_COVERAGE.items():
-        if (species, phenotype) in coverage:
-            level = AGENT_LEVEL[agent]
-            if level < best_level:
-                best_level = level
-                best_agent = agent
-    return best_agent if best_agent is not None else 'last-resort'
+    if species == 'none' or species is None:
+        return None
+
+    best_cov_drug = None
+    best_cov_tier = 999
+    best_par_drug = None
+    best_par_tier = 999
+
+    for drug in all_drugs():
+        state = effective_coverage(drug, species, resistances)
+        tier  = DRUG_TIER[drug]
+        if state == 'covers' and tier < best_cov_tier:
+            best_cov_tier = tier
+            best_cov_drug = drug
+        elif state == 'partial' and tier < best_par_tier:
+            best_par_tier = tier
+            best_par_drug = drug
+
+    return best_cov_drug if best_cov_drug is not None else best_par_drug
+
+
+def mutation_target(species: str, drug: str) -> str | None:
+    """If treating `species` with `drug` can induce resistance, return the
+    resulting R-phenotype label; otherwise None.
+
+    Mutation is possible only when the corresponding 'Drug-R' column
+    exists in that species' coverage sheet.
+    """
+    if species == 'none' or species is None or drug is None:
+        return None
+    r_label = DRUG_TO_R_PHENOTYPE.get(drug)
+    if r_label is None:
+        return None
+    cfg = PATHOGENS.get(species)
+    if cfg is None:
+        return None
+    if r_label in cfg['phenotypes']:
+        return r_label
+    return None
+
+
+def treatment_days_for(species: str, resistances) -> int:
+    """Treatment length given current resistance set.
+
+    7d for Susceptible (empty set), 10d for single-R, 14d for multi-R.
+    """
+    n = len(resistances) if resistances else 0
+    if n == 0:
+        return 7
+    if n == 1:
+        return 10
+    return 14
+
+
+# ─── Empiric agent precomputation ────────────────────────────────────────────
+# At infection onset the resistance set is the patient's current set. But the
+# *empiric* group is selected by species only (the lab hasn't returned a
+# phenotype yet, only Gram stain / species). Group 1 = the most stewardship-
+# friendly drug that covers the Susceptible phenotype for that species.
+# Group 2 = the next such drug. Override per species via EMPIRIC_OVERRIDE_*.
+
+EMPIRIC_OVERRIDE_GROUP_1: dict[str, str] = {
+    # Clinical defaults that match the prior model where applicable.
+    'kpneumoniae':  'Piperacillin-Tazobactam',
+    'enterobacter': 'Piperacillin-Tazobactam',
+    'paeruginosa':  'Piperacillin-Tazobactam',
+    'abaumannii':   'Ampicillin-Sulbactam',
+    'saureus':      'Vancomycin',
+    'efaecium':     'Vancomycin',
+}
+
+EMPIRIC_OVERRIDE_GROUP_2: dict[str, str] = {
+    'kpneumoniae':  'Cefepime',
+    'enterobacter': 'Cefepime',
+    'paeruginosa':  'Cefepime',
+    'abaumannii':   'Meropenem',
+    'saureus':      'Tigecycline',
+    'efaecium':     'Ampicillin-Sulbactam',
+}
+
+
+def _auto_empiric(species: str, exclude: set[str]) -> str | None:
+    """Lowest-tier 🟢 drug for Susceptible, skipping `exclude`. Falls back
+    to 🟡 if no 🟢 candidate is available."""
+    best_cov_drug = None
+    best_cov_tier = 999
+    best_par_drug = None
+    best_par_tier = 999
+    for drug in all_drugs():
+        if drug in exclude:
+            continue
+        state = effective_coverage(drug, species, frozenset())
+        tier  = DRUG_TIER[drug]
+        if state == 'covers' and tier < best_cov_tier:
+            best_cov_tier = tier
+            best_cov_drug = drug
+        elif state == 'partial' and tier < best_par_tier:
+            best_par_tier = tier
+            best_par_drug = drug
+    return best_cov_drug if best_cov_drug is not None else best_par_drug
+
+
+def empiric_group_1(species: str) -> str | None:
+    """Group-1 empiric agent for `species`."""
+    if species in EMPIRIC_OVERRIDE_GROUP_1:
+        return EMPIRIC_OVERRIDE_GROUP_1[species]
+    return _auto_empiric(species, exclude=set())
+
+
+def empiric_group_2(species: str) -> str | None:
+    """Group-2 empiric agent (must differ from Group 1)."""
+    if species in EMPIRIC_OVERRIDE_GROUP_2:
+        return EMPIRIC_OVERRIDE_GROUP_2[species]
+    g1 = empiric_group_1(species)
+    return _auto_empiric(species, exclude={g1} if g1 else set())
